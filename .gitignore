@@ -654,3 +654,5 @@ FodyWeavers.xsd
 *.msix
 *.msm
 *.msp
+
+/paraphrase-multilingual-MiniLM-L12-v2

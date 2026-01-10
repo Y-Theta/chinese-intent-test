@@ -1,58 +1,121 @@
-from sentence_transformers import SentenceTransformer
-from sklearn.linear_model import LogisticRegression
-import joblib
-import numpy as np
 import os
+import pandas as pd
+import numpy as np
+import joblib
+import onnxruntime as ort
+from sklearn.linear_model import LogisticRegression
+from optimum.onnxruntime import ORTModelForFeatureExtraction
+from transformers import AutoTokenizer
 
-# # 1. 加载预训练的中文语义模型 (模型体积小，效果极佳)
-# # 首次运行会下载模型（约 40MB）
-model_name = './paraphrase-multilingual-MiniLM-L12-v2'
-encoder = SentenceTransformer(model_name)
+class chinese_intent_train:
+    def __init__(self, model_dir="./paraphrase-multilingual-MiniLM-L12-v2", classifier_path="classifier.pkl"):
+        self.model_id = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+        self.model_dir = model_dir
+        self.classifier_path = classifier_path
+        self.tokenizer = None
+        self.session = None
 
-# # 2. 准备数据 (即便样本少，语义模型也能理解)
-# train_data = {
-#     "alarm": ["帮我定个闹钟", "设置提醒", "明早八点叫我", "开启闹铃"],
-#     "weather": ["天气预报", "今天冷吗", "外面下雨吗", "查一下气温"],
-#     "music": ["放首歌", "我想听周杰伦", "播一段轻音乐", "放点好听的曲子"],
-#     "time": ["现在几点", "告诉我时间", "现在的北京时间"]
-# }
+    def _mean_pooling(self, model_output, attention_mask):
+        """
+        手动实现 Mean Pooling，将 Token 向量转换为句子向量
+        """
+        token_embeddings = model_output[0] # First element contains all token embeddings
+        input_mask_expanded = np.expand_dims(attention_mask, -1).astype(float)
+        sum_embeddings = np.sum(token_embeddings * input_mask_expanded, axis=1)
+        sum_mask = np.clip(input_mask_expanded.sum(axis=1), a_min=1e-9, a_max=None)
+        return sum_embeddings / sum_mask
 
-# X_texts = []
-# y_labels = []
-# for label, texts in train_data.items():
-#     X_texts.extend(texts)
-#     y_labels.extend([label] * len(texts))
+    def _get_embeddings(self, texts):
+        """
+        使用 ONNX Runtime 批量提取文本向量
+        """
+        if self.session is None or self.tokenizer is None:
+            self.tokenizer = AutoTokenizer.from_pretrained(self.model_dir)
+            self.session = ort.InferenceSession(os.path.join(self.model_dir, "model.onnx"))
 
-# # 3. 将文本转化为语义向量 (Embedding)
-# print("正在提取语义特征...")
-# X_embeddings = encoder.encode(X_texts)
+        # 对文本进行编码
+        encoded_input = self.tokenizer(texts, padding=True, truncation=True, return_tensors="np")
+        
+        # ONNX 推理输入
+        onnx_inputs = {k: v for k, v in encoded_input.items()}
+        model_output = self.session.run(None, onnx_inputs)
+        
+        # 池化处理
+        sentence_embeddings = self._mean_pooling(model_output, encoded_input['attention_mask'])
+        return sentence_embeddings
 
-# # 4. 训练分类器
-# clf = LogisticRegression(class_weight='balanced')
-# clf.fit(X_embeddings, y_labels)
+    def prepareModel(self, proxy=None):
+        """
+        下载并转换为 ONNX
+        """
+        if proxy:
+            os.environ['http_proxy'] = proxy
+            os.environ['https_proxy'] = proxy
+            
+        print("正在导出 ONNX 模型...")
+        model = ORTModelForFeatureExtraction.from_pretrained(self.model_id, export=True)
+        tokenizer = AutoTokenizer.from_pretrained(self.model_id)
+        
+        model.save_pretrained(self.model_dir)
+        tokenizer.save_pretrained(self.model_dir)
+        print(f"ONNX 模型保存至: {self.model_dir}")
 
-# # 5. 导出模型 (保存编码器名称和分类器)
-# model_package = {
-#     'encoder_name': model_name,
-#     'classifier': clf,
-#     'labels': clf.classes_
-# }
-# joblib.dump(model_package, "semantic_intent_model.pkl")
-# print("高级语义模型已导出。")
+    def train_semantic_model(self, xlsx_path):
+        """
+        读取 Excel，使用 ONNX 提取向量，训练分类器
+        """
+        print(f"读取数据: {xlsx_path}")
+        df = pd.read_excel(xlsx_path)
+        labels = df.iloc[:, 0].values
+        texts = df.iloc[:, 1].values.tolist()
 
-# 6. 加载并预测
-def predict_semantic(text):
-    data = joblib.load("semantic_intent_model.pkl")
-    # 同样将输入文本转为向量
-    test_embedding = encoder.encode([text])
-    
-    # 预测概率
-    probs = data['classifier'].predict_proba(test_embedding)[0]
-    best_idx = np.argmax(probs)
-    
-    return data['labels'][best_idx], probs[best_idx]
+        print("使用 ONNX 提取特征向量 (这可能需要一点时间)...")
+        # 分批处理防止 OOM (内存溢出)
+        X_embeddings = self._get_embeddings(texts)
 
-# 测试：即使“曲子”没在训练集出现，模型也能通过语义关联到 music
-test_query = "明天西安的天气"
-intent, score = predict_semantic(test_query)
-print(f"输入: {test_query} \n预测意图: {intent} (置信度: {score:.4f})")
+        print("训练 LogisticRegression 分类器...")
+        clf = LogisticRegression(class_weight='balanced', max_iter=1000)
+        clf.fit(X_embeddings, labels)
+
+        joblib.dump(clf, self.classifier_path)
+        print(f"分类器训练完成并导出至: {self.classifier_path}")
+
+    def test_trainer(self, test_file_path="test.txt"):
+        """
+        加载本地 ONNX 和 分类器进行测试
+        """
+        if not os.path.exists(self.classifier_path):
+            print("分类器文件不存在，请先执行训练。")
+            return
+
+        clf = joblib.load(self.classifier_path)
+        
+        with open(test_file_path, "r", encoding="utf-8") as f:
+            test_cases = [line.strip() for line in f if line.strip()]
+
+        if not test_cases:
+            print("测试文件为空。")
+            return
+
+        print(f"\n{'测试文本':<30} | {'预测意图':<12} | {'置信度'}")
+        print("-" * 65)
+
+        embeddings = self._get_embeddings(test_cases)
+        predictions = clf.predict(embeddings)
+        probabilities = np.max(clf.predict_proba(embeddings), axis=1)
+
+        for text, intent, prob in zip(test_cases, predictions, probabilities):
+            print(f"{text:<30} | {intent:<12} | {prob:.4f}")
+
+# --- 运行逻辑 ---
+if __name__ == "__main__":
+    trainer = chinese_intent_train()
+
+    # 第一步：准备模型
+    # trainer.prepareModel(proxy="http://192.168.5.120:20171")
+
+    # 第二步：训练 (确保 excel 文件路径正确)
+    # trainer.train_semantic_model("data.xlsx")
+
+    # 第三步：测试
+    trainer.test_trainer("test.txt")
